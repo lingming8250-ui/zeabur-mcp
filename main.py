@@ -1,11 +1,13 @@
 """Zeabur MCP Server —— HTTP/SSE 双模式
 
 环境变量:
-    ZEABUR_TOKEN  Zeabur API Token (zat_ 开头，必填)
-    PORT          监听端口 (Zeabur 会自动注入)
+    ZEABUR_TOKEN    Zeabur API Token (zat_ 开头，必填)
+    MCP_AUTH_TOKEN  可选。设了之后，客户端必须在请求头里带 x-mcp-auth: <值>，
+                    否则一律 401。不设则不拦（裸奔，仅限自己知道域名时用）
+    PORT            监听端口 (Zeabur 会自动注入)
 
 对外端点:
-    GET  /health  健康检查
+    GET  /health  健康检查（永远不需要口令）
     POST /mcp     Streamable HTTP（推荐）→ 客户端填 https://你的域名/mcp
     GET  /sse     SSE 传输（备用）      → 客户端填 https://你的域名/sse
 
@@ -22,9 +24,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.routing import Mount
 
 ZEABUR_TOKEN = os.environ.get("ZEABUR_TOKEN", "").strip()
+MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "").strip()
 PORT = int(os.environ.get("PORT", 8765))
 GRAPHQL_URL = "https://api.zeabur.com/graphql"
 
@@ -122,7 +126,7 @@ async def list_services(project_id: str) -> str:
 
 @mcp.tool()
 async def get_service(service_id: str) -> str:
-    """获取服务详情：域名、模板、规格、最近一次部署。"""
+    """获取服务详情：域名、模板、最近几次部署。"""
     data = await gql("""
         query GetService($id: ObjectID!) {
           service(_id: $id) {
@@ -278,7 +282,8 @@ async def create_service(name: str, project_id: str) -> str:
 
 @mcp.tool()
 async def bind_git_repo(service_id: str, repo_url: str, branch: str = "main") -> str:
-    """把 GitHub 仓库绑定到服务，会立刻触发一次部署。repo_url 形如 https://github.com/用户名/仓库名。"""
+    """把 GitHub 仓库绑定到服务，会立刻触发一次部署。
+    repo_url 形如 https://github.com/用户名/仓库名"""
     data = await gql("""
         mutation BindGitRepo($serviceID: ObjectID!, $url: String!, $branch: String!) {
           bindGitRepository(serviceID: $serviceID, url: $url, branch: $branch) {
@@ -350,18 +355,53 @@ async def zeabur_graphql(query: str, variables_json: str = "") -> str:
 # 传输层
 # ═══════════════════════════════════════════
 #
-# 注意两件事，都是上一版踩过的坑：
-#   1) 必须先调用 streamable_http_app()，session_manager 才会就绪；
-#      而这个管家必须在 lifespan 里 run() 起来，否则每个 HTTP 请求都 500。
-#   2) streamable_http_app() 内部路径默认就是 "/mcp"，所以挂载点用 "/"，
-#      真实端点才是干净的 /mcp；挂到 "/mcp" 会变成 /mcp/mcp。
+# 这一段踩过的坑，按顺序记下来：
+#   1) streamable_http_app() 内部路径默认就是 "/mcp"，挂载点必须用 "/"，
+#      否则真实端点是 /mcp/mcp，客户端找 /mcp 只会拿到 404。
+#   2) session_manager 必须在 lifespan 里 run() 起来，
+#      否则每个请求都抛 "Task group is not initialized" → 500。
+#   3) 它默认开着 DNS-rebinding 保护，只认 Host 是 localhost 的请求，
+#      挂在真实域名后面一律 421 "Invalid Host header"。这里显式关掉。
 
 mcp_http_app = mcp.streamable_http_app()
 
 
+def _disable_dns_rebinding_guard() -> str:
+    """把 Streamable HTTP 的 Host / Origin 门禁关掉。
+
+    SDK 默认开了 DNS-rebinding 保护：只接受 Host 头是 localhost 的请求。
+    服务部署在真实域名后面时，每个请求都会被 421 Invalid Host header 打回。
+    这里把 session manager 的安全设置换成「关闭」，让真域名能进来。
+    """
+    manager = None
+    for attr in ("session_manager", "_session_manager"):
+        try:
+            candidate = getattr(mcp, attr, None)
+        except Exception:
+            candidate = None
+        if candidate is not None:
+            manager = candidate
+            break
+    if manager is None:
+        return "session manager 未就绪，跳过"
+    try:
+        manager.security_settings = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        )
+    except Exception as e:
+        return f"关闭失败: {e}"
+    return "已关闭"
+
+
+_TRANSPORT_SECURITY_STATE = _disable_dns_rebinding_guard()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    session_manager = getattr(mcp, "session_manager", None)
+    try:
+        session_manager = getattr(mcp, "session_manager", None)
+    except Exception:
+        session_manager = None
     if session_manager is None:
         yield
         return
@@ -376,6 +416,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class AuthGate:
+    """可选的访问口令。
+
+    故意写成纯 ASGI 中间件，而不是 @app.middleware("http")：
+    BaseHTTPMiddleware 会插手长连接，容易把 /sse 这种流式响应搞死。
+
+    不设 MCP_AUTH_TOKEN 时完全不拦；
+    设了之后，客户端必须在请求头里带 x-mcp-auth: <口令>，否则 401。
+    /health 永远放行，方便确认服务活着。
+    """
+
+    def __init__(self, app, token: str = ""):
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not self.token:
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path", "") == "/health":
+            await self.app(scope, receive, send)
+            return
+        provided = ""
+        for key, value in scope.get("headers") or []:
+            if key.lower() == b"x-mcp-auth":
+                provided = value.decode("latin-1")
+                break
+        if provided != self.token:
+            response = JSONResponse({"error": "unauthorized"}, status_code=401)
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(AuthGate, token=MCP_AUTH_TOKEN)
 
 # ── SSE（备用通道，手写传输，稳定） ──
 _sse = SseServerTransport("/messages/")
@@ -396,7 +473,12 @@ async def sse_handler(request: Request):
 
 @app.get("/health")
 async def health():
-    return JSONResponse({"status": "ok", "token_set": bool(ZEABUR_TOKEN)})
+    return JSONResponse({
+        "status": "ok",
+        "token_set": bool(ZEABUR_TOKEN),
+        "auth_required": bool(MCP_AUTH_TOKEN),
+        "dns_rebinding_guard": _TRANSPORT_SECURITY_STATE,
+    })
 
 
 # ── Streamable HTTP（主通道） ──
@@ -409,5 +491,7 @@ if __name__ == "__main__":
     print("🦊 Zeabur MCP Server")
     print(f"   Streamable HTTP: http://0.0.0.0:{PORT}/mcp")
     print(f"   SSE:             http://0.0.0.0:{PORT}/sse")
-    print(f"   Token: {'✅ 已设置' if ZEABUR_TOKEN else '❌ 未设置'}")
+    print(f"   Token:            {'✅ 已设置' if ZEABUR_TOKEN else '❌ 未设置'}")
+    print(f"   访问口令:         {'✅ 已设置' if MCP_AUTH_TOKEN else '⚠️ 未设置（不拦）'}")
+    print(f"   DNS 重绑定门禁:   {_TRANSPORT_SECURITY_STATE}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
