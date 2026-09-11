@@ -1,4 +1,21 @@
+"""Zeabur MCP Server —— HTTP/SSE 双模式
+
+环境变量:
+    ZEABUR_TOKEN  Zeabur API Token (zat_ 开头，必填)
+    PORT          监听端口 (Zeabur 会自动注入)
+
+对外端点:
+    GET  /health  健康检查
+    POST /mcp     Streamable HTTP（推荐）→ 客户端填 https://你的域名/mcp
+    GET  /sse     SSE 传输（备用）      → 客户端填 https://你的域名/sse
+
+依赖: 见 requirements.txt（注意 mcp 必须 <2）
+"""
+
 import os
+import json
+from contextlib import asynccontextmanager
+
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,9 +31,12 @@ GRAPHQL_URL = "https://api.zeabur.com/graphql"
 mcp = FastMCP("Zeabur")
 
 
-# ── GraphQL Helper ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════
+# GraphQL 底层
+# ═══════════════════════════════════════════
 
 async def gql(query: str, variables: dict = None) -> dict:
+    """向 Zeabur GraphQL API 发一次请求。成功返回 data，失败返回 {'error': ...}。"""
     if not ZEABUR_TOKEN:
         return {"error": "ZEABUR_TOKEN 未设置"}
     headers = {
@@ -26,20 +46,28 @@ async def gql(query: str, variables: dict = None) -> dict:
     body = {"query": query}
     if variables:
         body["variables"] = variables
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(GRAPHQL_URL, json=body, headers=headers)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(GRAPHQL_URL, json=body, headers=headers)
+    except Exception as e:
+        return {"error": f"请求失败: {e}"}
+    try:
         data = resp.json()
-        if "errors" in data:
-            return {"error": data["errors"]}
-        return data.get("data", {})
+    except Exception:
+        return {"error": f"HTTP {resp.status_code}: {resp.text[:300]}"}
+    if "errors" in data:
+        return {"error": data["errors"]}
+    return data.get("data") or {}
 
 
-# ── MCP 工具 ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════
+# 只读工具
+# ═══════════════════════════════════════════
 
 @mcp.tool()
 async def list_projects() -> str:
-    """列出所有 Zeabur 项目，返回 project_id、项目名和环境列表（含 environment_id）。
-    查日志前先调用此工具获取 project_id 和 environment_id。"""
+    """列出所有 Zeabur 项目，返回 project_id、项目名、区域和环境（含 environment_id）。
+    调用其他工具前，先用这个拿 project_id / environment_id。"""
     data = await gql("""
         query {
           projects(skip: 0, limit: 100) {
@@ -47,6 +75,7 @@ async def list_projects() -> str:
               node {
                 _id
                 name
+                region { code name }
                 environments { _id name }
               }
             }
@@ -61,10 +90,11 @@ async def list_projects() -> str:
     lines = []
     for e in edges:
         n = e["node"]
+        region = (n.get("region") or {}).get("name", "?")
         lines.append(f"📦 {n['name']}")
-        lines.append(f"   project_id: {n['_id']}")
-        for env in n.get("environments", []):
-            lines.append(f"   🌍 环境: {env['name']}  environment_id: {env['_id']}")
+        lines.append(f"   project_id: {n['_id']}  区域: {region}")
+        for env in n.get("environments") or []:
+            lines.append(f"   🌍 环境 {env['name']}  environment_id: {env['_id']}")
     return "\n".join(lines)
 
 
@@ -74,9 +104,7 @@ async def list_services(project_id: str) -> str:
     data = await gql("""
         query ListServices($projectID: ObjectID!) {
           services(projectID: $projectID) {
-            edges {
-              node { _id name }
-            }
+            edges { node { _id name template createdAt status } }
           }
         }
     """, {"projectID": project_id})
@@ -88,44 +116,64 @@ async def list_services(project_id: str) -> str:
     lines = []
     for e in edges:
         n = e["node"]
-        lines.append(f"🔧 {n['name']}  service_id: {n['_id']}")
+        lines.append(f"🔧 {n['name']}  service_id: {n['_id']}  状态: {n.get('status')}")
     return "\n".join(lines)
 
 
 @mcp.tool()
-async def get_runtime_logs(service_id: str, environment_id: str) -> str:
-    """获取服务运行时日志（启动输出、报错等）。
-    service_id 从 list_services 获取，environment_id 从 list_projects 获取。"""
+async def get_service(service_id: str) -> str:
+    """获取服务详情：域名、模板、规格、最近一次部署。"""
     data = await gql("""
-        query RuntimeLogs($serviceID: ObjectID!, $environmentID: ObjectID!) {
-          runtimeLogs(serviceID: $serviceID, environmentID: $environmentID) {
-            message
-            timestamp
+        query GetService($id: ObjectID!) {
+          service(_id: $id) {
+            _id name template createdAt status
+            domains { _id domain status isGenerated }
+            deployments { _id status createdAt }
+          }
+        }
+    """, {"id": service_id})
+    if "error" in data:
+        return f"❌ {data['error']}"
+    svc = data.get("service") or {}
+    if not svc:
+        return "📭 未找到该服务"
+    lines = [f"🔧 {svc['name']}  service_id: {svc['_id']}"]
+    lines.append(f"   状态: {svc.get('status')}  模板: {svc.get('template')}")
+    for d in svc.get("domains") or []:
+        lines.append(f"   🌐 {d['domain']}  ({d.get('status')})")
+    for d in (svc.get("deployments") or [])[:3]:
+        lines.append(f"   📋 {d['status']}  deployment_id: {d['_id']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_env_vars(service_id: str, environment_id: str) -> str:
+    """获取指定服务的所有环境变量。"""
+    data = await gql("""
+        query ServiceVars($serviceID: ObjectID!, $environmentID: ObjectID!) {
+          service(_id: $serviceID) {
+            variables(environmentID: $environmentID) { key value }
           }
         }
     """, {"serviceID": service_id, "environmentID": environment_id})
     if "error" in data:
         return f"❌ {data['error']}"
-    logs = data.get("runtimeLogs", [])
-    if not logs:
-        return "📭 没有运行时日志"
-    lines = [f"📋 Runtime 日志（共 {len(logs)} 条，显示最后 200 条）"]
-    for entry in logs[-200:]:
-        ts = (entry.get("timestamp") or "")[:19]
-        lines.append(f"[{ts}] {entry.get('message', '')}")
+    variables = (data.get("service") or {}).get("variables") or []
+    if not variables:
+        return "📭 没有环境变量"
+    lines = ["📋 环境变量:"]
+    for v in variables:
+        lines.append(f"   {v['key']} = {v['value']}")
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def get_deployments(service_id: str, environment_id: str) -> str:
-    """获取服务的部署列表（含 deployment_id 和状态）。
-    查 build 日志前需先调用此工具获取 deployment_id。"""
+    """获取服务的部署历史（含 deployment_id）。查构建日志前先调这个。"""
     data = await gql("""
-        query Deployments($serviceID: ObjectID!, $environmentID: ObjectID!) {
+        query GetDeployments($serviceID: ObjectID!, $environmentID: ObjectID!) {
           deployments(serviceID: $serviceID, environmentID: $environmentID) {
-            edges {
-              node { _id status createdAt }
-            }
+            edges { node { _id status createdAt } }
           }
         }
     """, {"serviceID": service_id, "environmentID": environment_id})
@@ -134,7 +182,7 @@ async def get_deployments(service_id: str, environment_id: str) -> str:
     edges = data.get("deployments", {}).get("edges", [])
     if not edges:
         return "📭 没有部署记录"
-    lines = ["📋 部署列表"]
+    lines = []
     for e in edges:
         n = e["node"]
         ts = (n.get("createdAt") or "")[:19]
@@ -144,32 +192,184 @@ async def get_deployments(service_id: str, environment_id: str) -> str:
 
 @mcp.tool()
 async def get_build_logs(deployment_id: str) -> str:
-    """获取指定部署的构建日志（依赖安装、编译过程）。
-    deployment_id 从 get_deployments 获取。"""
+    """获取指定部署的构建日志（依赖安装、编译过程）。"""
     data = await gql("""
         query BuildLogs($deploymentID: ObjectID!) {
-          buildLogs(deploymentID: $deploymentID) {
-            message
-            timestamp
-          }
+          buildLogs(deploymentID: $deploymentID) { message timestamp }
         }
     """, {"deploymentID": deployment_id})
     if "error" in data:
         return f"❌ {data['error']}"
-    logs = data.get("buildLogs", [])
+    logs = data.get("buildLogs") or []
     if not logs:
         return "📭 没有构建日志"
-    lines = [f"📋 Build 日志（共 {len(logs)} 条，显示最后 200 条）"]
+    lines = [f"📋 构建日志（共 {len(logs)} 条，显示最后 200 条）"]
     for entry in logs[-200:]:
         ts = (entry.get("timestamp") or "")[:19]
         lines.append(f"[{ts}] {entry.get('message', '')}")
     return "\n".join(lines)
 
 
-# ── FastAPI + 传输层 ──────────────────────────────────────────────────────────
+@mcp.tool()
+async def get_runtime_logs(service_id: str, environment_id: str, project_id: str = "") -> str:
+    """获取服务的运行时日志（启动输出、报错等）。
+    service_id 从 list_services 拿，environment_id 从 list_projects 拿；
+    project_id 可选，填了接口兼容性更好。"""
+    query = """
+        query RuntimeLogs($serviceID: ObjectID!, $environmentID: ObjectID!, $projectID: ObjectID) {
+          runtimeLogs(serviceID: $serviceID, environmentID: $environmentID, projectID: $projectID) {
+            message timestamp
+          }
+        }
+    """
+    variables = {"serviceID": service_id, "environmentID": environment_id}
+    if project_id:
+        variables["projectID"] = project_id
+    data = await gql(query, variables)
+    if "error" in data:
+        return f"❌ {data['error']}"
+    logs = data.get("runtimeLogs") or []
+    if not logs:
+        return "📭 没有运行时日志"
+    lines = [f"📋 运行时日志（共 {len(logs)} 条，显示最后 200 条）"]
+    for entry in logs[-200:]:
+        ts = (entry.get("timestamp") or "")[:19]
+        lines.append(f"[{ts}] {entry.get('message', '')}")
+    return "\n".join(lines)
 
-app = FastAPI(title="Zeabur MCP")
 
+# ═══════════════════════════════════════════
+# 写操作工具
+# ═══════════════════════════════════════════
+
+@mcp.tool()
+async def create_project(name: str) -> str:
+    """新建一个 Zeabur 项目。"""
+    data = await gql("""
+        mutation CreateProject($name: String!) {
+          createProject(name: $name) { _id name }
+        }
+    """, {"name": name})
+    if "error" in data:
+        return f"❌ 创建项目失败: {data['error']}"
+    p = data.get("createProject") or {}
+    if not p:
+        return "❌ 创建项目失败（接口没返回内容）"
+    return f"✅ 项目已创建: {p['name']}  project_id: {p['_id']}"
+
+
+@mcp.tool()
+async def create_service(name: str, project_id: str) -> str:
+    """在指定项目中新建一个服务（PREBUILT 模板，随后可用 bind_git_repo 绑仓库）。"""
+    data = await gql("""
+        mutation CreateService($name: String!, $projectID: ObjectID!) {
+          createService(name: $name, template: PREBUILT_V2, projectID: $projectID) {
+            _id name status
+          }
+        }
+    """, {"name": name, "projectID": project_id})
+    if "error" in data:
+        return f"❌ 创建服务失败: {data['error']}"
+    s = data.get("createService") or {}
+    if not s:
+        return "❌ 创建服务失败（接口没返回内容）"
+    return f"✅ 服务已创建: {s['name']}  service_id: {s['_id']}  状态: {s.get('status')}"
+
+
+@mcp.tool()
+async def bind_git_repo(service_id: str, repo_url: str, branch: str = "main") -> str:
+    """把 GitHub 仓库绑定到服务，会立刻触发一次部署。repo_url 形如 https://github.com/用户名/仓库名。"""
+    data = await gql("""
+        mutation BindGitRepo($serviceID: ObjectID!, $url: String!, $branch: String!) {
+          bindGitRepository(serviceID: $serviceID, url: $url, branch: $branch) {
+            _id name status
+          }
+        }
+    """, {"serviceID": service_id, "url": repo_url, "branch": branch})
+    if "error" in data:
+        return f"❌ 绑定仓库失败: {data['error']}"
+    s = data.get("bindGitRepository") or {}
+    if not s:
+        return "❌ 绑定仓库失败（接口没返回内容）"
+    return f"✅ 已绑定: {s['name']}  状态: {s.get('status')}（已触发部署，用 get_deployments 看进度）"
+
+
+@mcp.tool()
+async def set_env_var(service_id: str, environment_id: str, key: str, value: str) -> str:
+    """给服务设置一个环境变量（已存在则更新）。"""
+    data = await gql("""
+        mutation SetEnvVar($serviceID: ObjectID!, $environmentID: ObjectID!, $key: String!, $value: String!) {
+          createEnvironmentVariable(serviceID: $serviceID, environmentID: $environmentID, key: $key, value: $value) {
+            key value
+          }
+        }
+    """, {"serviceID": service_id, "environmentID": environment_id, "key": key, "value": value})
+    if "error" in data:
+        return f"❌ 设置环境变量失败: {data['error']}"
+    v = data.get("createEnvironmentVariable") or {}
+    if not v:
+        return "❌ 设置环境变量失败（接口没返回内容）"
+    return f"✅ {v['key']} = {v['value']}"
+
+
+@mcp.tool()
+async def delete_env_var(service_id: str, environment_id: str, key: str) -> str:
+    """删除服务上的某个环境变量。"""
+    data = await gql("""
+        mutation DeleteEnvVar($serviceID: ObjectID!, $environmentID: ObjectID!, $key: String!) {
+          deleteSingleEnvironmentVariable(serviceID: $serviceID, environmentID: $environmentID, key: $key) {
+            key
+          }
+        }
+    """, {"serviceID": service_id, "environmentID": environment_id, "key": key})
+    if "error" in data:
+        return f"❌ 删除环境变量失败: {data['error']}"
+    return f"✅ 已删除 {key}"
+
+
+@mcp.tool()
+async def zeabur_graphql(query: str, variables_json: str = "") -> str:
+    """万能口子：把你的 GraphQL 语句原样打到 Zeabur 官方 API 上。
+    用在：查本文件没封装的字段、内省 schema、执行没封装的写操作。
+    例：query 填 '{ __schema { mutationType { fields { name } } } }' 可以列出全部可用的写操作。
+    variables_json 是可选的变量对象（JSON 字符串）。
+    这是全权限通道，能做你 Token 权限内的任何事，调用前请想清楚。"""
+    variables = None
+    if variables_json.strip():
+        try:
+            variables = json.loads(variables_json)
+        except Exception as e:
+            return f"❌ variables_json 不是合法 JSON: {e}"
+    data = await gql(query, variables)
+    if "error" in data:
+        return f"❌ {data['error']}"
+    return json.dumps(data, ensure_ascii=False, indent=2)[:8000]
+
+
+# ═══════════════════════════════════════════
+# 传输层
+# ═══════════════════════════════════════════
+#
+# 注意两件事，都是上一版踩过的坑：
+#   1) 必须先调用 streamable_http_app()，session_manager 才会就绪；
+#      而这个管家必须在 lifespan 里 run() 起来，否则每个 HTTP 请求都 500。
+#   2) streamable_http_app() 内部路径默认就是 "/mcp"，所以挂载点用 "/"，
+#      真实端点才是干净的 /mcp；挂到 "/mcp" 会变成 /mcp/mcp。
+
+mcp_http_app = mcp.streamable_http_app()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    session_manager = getattr(mcp, "session_manager", None)
+    if session_manager is None:
+        yield
+        return
+    async with session_manager.run():
+        yield
+
+
+app = FastAPI(title="Zeabur MCP", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -177,9 +377,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# SSE
+# ── SSE（备用通道，手写传输，稳定） ──
 _sse = SseServerTransport("/messages/")
 app.router.routes.append(Mount("/messages", app=_sse.handle_post_message))
+
 
 @app.get("/sse")
 async def sse_handler(request: Request):
@@ -192,18 +393,21 @@ async def sse_handler(request: Request):
             mcp._mcp_server.create_initialization_options(),
         )
 
-# Streamable HTTP
-app.mount("/mcp", mcp.streamable_http_app())
-
 
 @app.get("/health")
 async def health():
-    return JSONResponse({
-        "status": "ok",
-        "token_set": bool(ZEABUR_TOKEN),
-    })
+    return JSONResponse({"status": "ok", "token_set": bool(ZEABUR_TOKEN)})
+
+
+# ── Streamable HTTP（主通道） ──
+# 挂到根上，真实端点 = streamable_http_app 内部的 /mcp
+app.mount("/", mcp_http_app)
 
 
 if __name__ == "__main__":
     import uvicorn
+    print("🦊 Zeabur MCP Server")
+    print(f"   Streamable HTTP: http://0.0.0.0:{PORT}/mcp")
+    print(f"   SSE:             http://0.0.0.0:{PORT}/sse")
+    print(f"   Token: {'✅ 已设置' if ZEABUR_TOKEN else '❌ 未设置'}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
